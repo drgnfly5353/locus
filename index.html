@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LOCUS</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Courier New", monospace;
+    color: #777; user-select: none; -webkit-user-select: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { position: fixed; inset: 0; pointer-events: none; }
+  #title { position: absolute; left: 26px; top: 22px; font-size: 11px; letter-spacing: .4em; color: #666; }
+  #title small { display: block; margin-top: 6px; font-size: 10px; letter-spacing: .2em; color: #444; }
+  #hint { position: absolute; right: 26px; top: 22px; font-size: 10px; letter-spacing: .2em; color: #444; }
+  #law { position: absolute; left: 26px; bottom: 30px; font-size: 10px; letter-spacing: .12em; color: #4a4a4a; white-space: pre; line-height: 1.8; }
+  #law b { font-weight: normal; color: #7a7a7a; letter-spacing: .3em; }
+  #controls { position: absolute; left: 0; right: 0; bottom: 30px; display: flex; justify-content: center; gap: 14px; }
+  button {
+    pointer-events: auto; appearance: none; cursor: pointer;
+    background: transparent; color: #8a8a8a; border: 1px solid #3e3e3e;
+    min-width: 210px; padding: 11px 20px;
+    font: inherit; font-size: 11px; letter-spacing: .28em; text-transform: uppercase;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  button:hover { border-color: #7a7a7a; }
+  button:focus-visible { outline: 1px dashed #7a7a7a; outline-offset: 3px; }
+  button .k { color: #4a4a4a; margin-right: 12px; }
+  button.flash { background: #cfcfcf; color: #000; border-color: #cfcfcf; }
+  button.flash .k { color: #000; opacity: .45; }
+  /* phones: the two buttons share the width, the law sits above them, no keyboard hints */
+  @media (max-width: 600px) {
+    #controls { left: 16px; right: 16px; bottom: max(20px, env(safe-area-inset-bottom)); gap: 10px; }
+    button { min-width: 0; flex: 1; padding: 13px 8px; letter-spacing: .16em; }
+    button .k { display: none; }
+    #law { left: 16px; right: 16px; bottom: calc(max(20px, env(safe-area-inset-bottom)) + 58px); white-space: pre-wrap; }
+    #title { left: 16px; }
+    #hint { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="title">LOCUS<small>a point · a line · two actions</small></div>
+  <div id="hint">F fullscreen · R reset</div>
+  <div id="law"></div>
+  <div id="controls">
+    <button id="arms"><span class="k">Z</span><span id="armsLabel"></span></button>
+    <button id="family"><span class="k">X</span><span id="familyLabel"></span></button>
+  </div>
+</div>
+<script>
+(() => {
+'use strict';
+
+/* ───────── a point, a line, two actions ─────────
+   The point travels the line and now and then sheds a seed: a form of N
+   lines leaving it in rotational symmetry, each line a spiral drawn
+   slowly outward. When a line finishes, a new form buds from its tip, a
+   little smaller, in whatever the two buttons say at that moment. So one
+   seed grows into a cascade that envelops the screen, and the buttons
+   steer the living thing: action 1 sets how many lines each bud has,
+   action 2 sets which spiral they are.
+   Every family is given by its heading φ as a function of a parameter t
+   and its arc length rate ds/dt, so one tracer draws them all: it steps
+   h along the heading, then moves t on by h / (ds/dt). The smooth
+   spirals use a fine step. The curlicue and the spiral of Theodorus are
+   chord walks with a coarse step, and that is the whole difference.      */
+
+const LAP      = 64;         // seconds for the point to cross the line
+const LIFE     = 50;         // seconds until a line has faded away
+const EVERY    = 20;         // seconds between seeds from the point
+const S_MIN    = 90, S_MAX = 240;   // size of a seed (px), cycling along the line
+const DECAY    = 0.92;       // a bud is this much the size of the form it grows from
+const S_FLOOR  = 55;         // no buds smaller than this
+const ROOM     = 1.6;        // a bud needs this much of its size clear of every other form's centre
+const MAX_GROWING = 400;     // budding pauses while this many lines are growing …
+const MAX_POINTS  = 140000;  // … or this many points are on screen
+const H_FINE   = 4;          // step (px) of a smooth curve
+const V_FINE   = 150;        // px/s along a smooth curve …
+const V_BOOST  = 90;         // … rising where it turns tightly:  v = V_FINE · (1 + κ·V_BOOST)
+const STEPS_PS = 36;         // chords per second of a chord walk
+const ALPHA    = 0.55, TIP = 6, CHUNK = 20, LEVELS = 24;
+const ARMS     = [2, 3, 4, 5, 6, 8, 12];
+
+const PHI_G = (1 + Math.sqrt(5)) / 2;
+const THEO = [0];                                   // Theodorus: the angle of the n-th vertex
+for (let k = 1; k <= 1400; k++) THEO[k] = THEO[k - 1] + Math.atan(1 / Math.sqrt(k));
+
+const eulerSpec = S => {
+  const a = Math.PI / (4 * S * S);                  // eye distance = ½·√(π/a) = S
+  return { t0: 0, tmax: Infinity, stop: Infinity, euler: true, a, rhoMin: Math.max(8, S / 16),   // the eye closes at this radius
+           heading: t => a * t * t, dphi: t => 2 * a * t, dsdt: () => 1, radius: () => 0 };
+};
+
+const FAMILIES = [
+  { name: 'euler', formula: 'κ = 2a·s', about: 'curvature grows with length · winds into an eye',
+    make: S => ({ fine: eulerSpec(S) }) },
+
+  { name: 'curlicue', formula: 'κ = 2a·s  in chords of h   ·   Σ e^(iπ·s·n²)',
+    about: 'the same law in chords · the chords escape the eye and go on, spiral after spiral',
+    make: S => ({ fine: eulerSpec(S), coarse: Object.assign(eulerSpec(S), { H: Math.max(6, S / 6), maxSteps: 260 }) }) },   // one escape, then it buds
+
+  { name: 'logarithmic', formula: 'r = k·e^(bθ)   b = ln φ / (π/2)',
+    about: 'self-similar · grows by the golden ratio every quarter turn',
+    make: S => {
+      const b = Math.log(PHI_G) / (Math.PI / 2), r0 = 1.5, c = Math.atan(1 / b), q = Math.sqrt(1 + b * b);
+      return { fine: { t0: 0, tmax: Infinity, stop: 1.25 * S,
+        heading: t => t + c, dphi: () => 1, dsdt: t => r0 * q * Math.exp(b * t), radius: t => r0 * Math.exp(b * t) } };
+    } },
+
+  { name: 'fermat', formula: 'r² = k·θ', about: 'r grows with √θ · the turns pack closer and closer',
+    make: S => {
+      const k = S / Math.sqrt(2.5 * Math.PI);                    // a turn and a quarter reach S
+      return { fine: { t0: 0.002, tmax: Infinity, stop: 1.2 * S,
+        heading: t => t + Math.atan(2 * t), dphi: t => 1 + 2 / (1 + 4 * t * t),
+        dsdt: t => k * Math.sqrt(t + 0.25 / t), radius: t => k * Math.sqrt(t) } };
+    } },
+
+  { name: 'archimedean', formula: 'r = k·θ', about: 'r grows with θ · evenly spaced turns',
+    make: S => {
+      const k = S / (3 * Math.PI);                                // a turn and a half reach S
+      return { fine: { t0: 0, tmax: Infinity, stop: 1.15 * S,
+        heading: t => t + Math.atan(t), dphi: t => 1 + 1 / (1 + t * t),
+        dsdt: t => k * Math.sqrt(1 + t * t), radius: t => k * t } };
+    } },
+
+  { name: 'theodorus', formula: 'rₙ = √n', about: 'unit chords on hypotenuses √1, √2, √3 … · Theodorus stopped at √17',
+    make: S => {
+      const h = Math.max(12, S / 6);
+      return { coarse: { t0: -1, tmax: Infinity, stop: 1.1 * S, H: h, maxSteps: 700, spokes: 17,
+        heading: n => n < 0 ? 0 : THEO[Math.min(1400, Math.round(n))] + Math.PI / 2,
+        dphi: () => 0, dsdt: () => h, radius: n => h * Math.sqrt(Math.max(0, n) + 1) } };
+    } },
+
+  { name: 'hyperbolic', formula: 'r = k/θ', about: 'r shrinks with 1/θ · unrolls into a straight line',
+    make: S => {
+      const k = 0.7 * S, tm = 10;                                  // starts at r = k/10, a turn and a half to r = k
+      return { fine: { t0: 0, tmax: tm - 0.05, stop: 1.8 * S,
+        heading: t => { const th = tm - t; return th - Math.atan(th); },
+        dphi:    t => { const th = tm - t; return th * th / (1 + th * th); },
+        dsdt:    t => { const th = tm - t; return (k / th) * Math.sqrt(1 + 1 / (th * th)); },
+        radius:  t => k / (tm - t) } };
+    } },
+
+  { name: 'lituus', formula: 'r²·θ = k', about: 'r shrinks with 1/√θ · the crozier',
+    make: S => {
+      const k = 0.55 * S, tm = 12;
+      return { fine: { t0: 0, tmax: tm - 0.02, stop: 1.35 * S,
+        heading: t => { const th = tm - t; return th - Math.atan(2 * th); },
+        dphi:    t => { const th = tm - t; return Math.abs(1 - 2 / (1 + 4 * th * th)); },
+        dsdt:    t => { const th = tm - t; return (k / Math.sqrt(th)) * Math.sqrt(1 + 0.25 / (th * th)); },
+        radius:  t => k / Math.sqrt(tm - t) } };
+    } },
+];
+
+const cv  = document.getElementById('c'), c = cv.getContext('2d');
+const btn = { arms: document.getElementById('arms'), family: document.getElementById('family') };
+const lbl = { arms: document.getElementById('armsLabel'), family: document.getElementById('familyLabel') };
+const law = document.getElementById('law');
+
+let W = 1, H = 1, CY = 0;
+let u = 0, lap = 0, clock = 0;             // position along the line in [0,1), laps so far, seconds
+let armIdx = 0, famIdx = 0;
+let nextSeed = 0.5, count = 0;
+let forms = [], pulses = [];
+let growingNow = 0, pointsNow = 0;         // the budgets, recounted every step
+
+const lerp   = (a, b, t) => a + (b - a) * t;
+const sizeAt = t => Math.exp(lerp(Math.log(S_MIN), Math.log(S_MAX), 0.5 + 0.5 * Math.sin(4 * Math.PI * t)));
+
+/* ───────── forms: N lines in rotational symmetry, one tracer each ───────── */
+const branch = (x, y, base, spec, coarse) => ({
+  x, y, t: spec.t0, s: 0, n: 0, acc: 0, base, spec, coarse,
+  pts: [x, y], times: [clock], fac: [1], spokes: [], start: 0, done: false
+});
+
+function shed(x, y, S, phi0, sigma, gen) {
+  const N = ARMS[armIdx], specs = FAMILIES[famIdx].make(S);
+  const f = { x, y, S, gen, sigma, branches: [] };
+  for (let j = 0; j < N; j++) {
+    const base = phi0 + 2 * Math.PI * j / N;
+    if (specs.fine)   f.branches.push(branch(x, y, base, specs.fine, false));
+    if (specs.coarse) f.branches.push(branch(x, y, base, specs.coarse, true));
+  }
+  forms.push(f); count++;
+  return f;
+}
+
+function seed() {                                   // the point sheds a seed
+  const S = sizeAt(u) * Math.pow(2 / ARMS[armIdx], 0.25);       // more lines, a little finer
+  shed(u * W, 0, S, 2 * Math.PI * u + lap * 2.4, count % 2 ? -1 : 1, 0);
+  pulses.push({ x: u * W, y: 0, t: 0, r: 40 });
+}
+
+function bud(f, br) {                               // a finished line buds a new form at its tip
+  const S = f.S * DECAY;
+  if (S < S_FLOOR || growingNow > MAX_GROWING || pointsNow > MAX_POINTS) return;
+  if (br.x < -60 || br.x > W + 60 || Math.abs(br.y) > H / 2 + 60) return;
+  const room = ROOM * S;
+  for (const o of forms) { if (o === f) continue; const dx = o.x - br.x, dy = o.y - br.y; if (dx * dx + dy * dy < room * room) return; }   // no room here
+  const phi = Math.atan2(br.y - f.y, br.x - f.x);               // one line carries on away from the form it grew from
+  shed(br.x, br.y, S, phi, -f.sigma, f.gen + 1);
+  pulses.push({ x: br.x, y: br.y, t: 0, r: 14 });
+}
+
+function advance(f, br, len, fac) {
+  const sp = br.spec, phi = br.base + f.sigma * sp.heading(br.t);
+  br.x += len * Math.cos(phi); br.y += len * Math.sin(phi);
+  br.t = Math.min(sp.tmax, br.t + len / sp.dsdt(br.t)); br.s += len; br.n++;
+  br.pts.push(br.x, br.y); br.times.push(clock); br.fac.push(fac);
+  if (sp.spokes && br.n <= sp.spokes) br.spokes.push(br.x, br.y, clock);
+  if (br.s > 9000 || br.x < -400 || br.x > W + 400 || Math.abs(br.y) > H / 2 + 400) br.done = true;   // lost: no bud
+}
+
+function grow(f, br, dt) {
+  const sp = br.spec;
+  if (br.coarse) {
+    br.acc += STEPS_PS * dt;
+    while (br.acc >= 1 && !br.done) {
+      br.acc -= 1;
+      const tn = Math.min(sp.tmax, br.t + sp.H / sp.dsdt(br.t));
+      const k = Math.cos((sp.heading(tn) - sp.heading(br.t)) / 2);    // chords that turn sharply retrace themselves:
+      advance(f, br, sp.H, 0.22 + 0.78 * k * k * k * k);               // draw them fainter so the polygons show
+      if (!br.done && (br.n >= sp.maxSteps || br.t >= sp.tmax || sp.radius(br.t) > 1.2 * sp.stop)) { br.done = true; bud(f, br); }
+    }
+  } else {
+    const kappa = Math.min(1, sp.dphi(br.t) / sp.dsdt(br.t));
+    br.acc += V_FINE * (1 + kappa * V_BOOST) * dt;
+    while (br.acc >= H_FINE && !br.done) {
+      br.acc -= H_FINE;
+      advance(f, br, H_FINE, 1);
+      if (!br.done && (sp.euler ? 2 * sp.a * br.t * sp.rhoMin > 1 : (br.t >= sp.tmax || sp.radius(br.t) > sp.stop))) { br.done = true; bud(f, br); }
+    }
+  }
+}
+
+function trim(br) {
+  const n = br.times.length;
+  while (br.start < n - 1 && clock - br.times[br.start + 1] > LIFE) br.start++;
+  if (br.start > 3000) { br.pts.splice(0, 2 * br.start); br.times.splice(0, br.start); br.fac.splice(0, br.start); br.start = 0; }
+}
+
+/* ───────── time ───────── */
+function step(dt) {
+  clock += dt;
+  u += dt / LAP;
+  if (u >= 1) { u -= 1; lap++; }
+  if (clock >= nextSeed) { seed(); nextSeed = clock + EVERY; }
+  let g = 0, p = 0;
+  for (const f of forms) for (const br of f.branches) {
+    if (!br.done) grow(f, br, dt);
+    trim(br);
+    if (!br.done) g++;
+    p += br.times.length - br.start;
+  }
+  growingNow = g; pointsNow = p;
+  forms = forms.filter(f => f.branches.some(br => !br.done || br.start < br.times.length - 1));
+  for (const q of pulses) q.t += dt;
+  pulses = pulses.filter(q => q.t < 0.8);
+  runDemo();
+}
+
+/* ───────── drawing ───────── */
+const alphaFor = age => { const k = 1 - age / LIFE; return k <= 0 ? 0 : ALPHA * Math.pow(k, 1.3); };
+const level = al => Math.min(LEVELS - 1, Math.round(al / ALPHA * (LEVELS - 1)));
+
+function render() {
+  c.clearRect(0, 0, W, H);
+  c.lineWidth = 1; c.lineJoin = 'round'; c.lineCap = 'round'; c.strokeStyle = '#fff'; c.fillStyle = '#fff';
+
+  c.globalAlpha = 0.14;
+  c.beginPath(); c.moveTo(0, CY); c.lineTo(W, CY); c.stroke();
+
+  const paths = new Array(LEVELS);                                   // every line, batched by brightness
+  for (const f of forms) for (const br of f.branches) {
+    const n = br.times.length, p = br.pts;
+    for (let i = br.start; i < n - 1; i += CHUNK) {
+      const j = Math.min(n - 1, i + CHUNK), m = (i + j) >> 1;
+      const lv = level(alphaFor(clock - br.times[m]) * br.fac[m]);
+      if (lv === 0) continue;
+      const path = paths[lv] || (paths[lv] = new Path2D());
+      path.moveTo(p[2 * i], CY + p[2 * i + 1]);
+      for (let k = i + 1; k <= j; k++) path.lineTo(p[2 * k], CY + p[2 * k + 1]);
+    }
+    for (let i = 0; i < br.spokes.length; i += 3) {                   // the hypotenuses of Theodorus
+      const lv = level(alphaFor(clock - br.spokes[i + 2]) * 0.7);
+      if (lv === 0) continue;
+      const path = paths[lv] || (paths[lv] = new Path2D());
+      path.moveTo(f.x, CY + f.y); path.lineTo(br.spokes[i], CY + br.spokes[i + 1]);
+    }
+  }
+  for (let lv = 1; lv < LEVELS; lv++) if (paths[lv]) { c.globalAlpha = ALPHA * lv / (LEVELS - 1); c.stroke(paths[lv]); }
+
+  c.globalAlpha = 0.9; c.beginPath();                                // the growing ends, bright
+  for (const f of forms) for (const br of f.branches) if (!br.done) {
+    const n = br.times.length, from = Math.max(br.start, n - TIP), p = br.pts;
+    c.moveTo(p[2 * from], CY + p[2 * from + 1]);
+    for (let k = from + 1; k < n; k++) c.lineTo(p[2 * k], CY + p[2 * k + 1]);
+    if (br.coarse) { const l = br.acc * br.spec.H, phi = br.base + f.sigma * br.spec.heading(br.t); c.lineTo(br.x + l * Math.cos(phi), CY + br.y + l * Math.sin(phi)); }
+  }
+  c.stroke();
+
+  for (const q of pulses) {
+    const k = q.t / 0.8, e = 1 - (1 - k) * (1 - k);
+    c.globalAlpha = 0.4 * (1 - k);
+    c.beginPath(); c.arc(q.x, CY + q.y, 3 + q.r * e, 0, 2 * Math.PI); c.stroke();
+  }
+
+  const x = u * W;                                                   // the point and its tail
+  const g = c.createLinearGradient(x - 70, 0, x, 0);
+  g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(1, 'rgba(255,255,255,0.7)');
+  c.globalAlpha = 1; c.strokeStyle = g;
+  c.beginPath(); c.moveTo(x - 70, CY); c.lineTo(x, CY); c.stroke();
+  c.beginPath(); c.arc(x, CY, 2.5, 0, 2 * Math.PI); c.fill();
+  c.strokeStyle = 'rgba(255,255,255,0.35)';
+  c.beginPath(); c.arc(x, CY, 7, 0, 2 * Math.PI); c.stroke();
+}
+
+/* ───────── the two actions ───────── */
+let lawText = '';
+function refresh() {
+  const N = ARMS[armIdx], F = FAMILIES[famIdx];
+  lbl.arms.textContent = N + ' lines · ' + Math.round(360 / N * 10) / 10 + '°';
+  lbl.family.textContent = F.name;
+  const txt = '<b>' + F.name.toUpperCase() + '</b>   ' + F.formula + '\n' + F.about;
+  if (txt !== lawText) law.innerHTML = lawText = txt;
+}
+function flash(el) { el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 180); }
+function nextArms()   { armIdx = (armIdx + 1) % ARMS.length;     refresh(); flash(btn.arms);   seed(); nextSeed = clock + EVERY; }
+function nextFamily() { famIdx = (famIdx + 1) % FAMILIES.length; refresh(); flash(btn.family); seed(); nextSeed = clock + EVERY; }
+function reset() {
+  forms = []; pulses = []; u = 0; lap = 0; clock = 0; nextSeed = 0.5; count = 0; demoIdx = 0;
+  growingNow = 0; pointsNow = 0; armIdx = 0; famIdx = 0; refresh();
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight; CY = Math.floor(H / 2) + 0.5;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+
+window.addEventListener('keydown', e => {
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'z' || k === 'arrowleft' || k === '1')       { nextArms(); e.preventDefault(); }
+  else if (k === 'x' || k === 'arrowright' || k === '2') { nextFamily(); e.preventDefault(); }
+  else if (k === 'r') reset();
+  else if (k === 'f') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  }
+});
+btn.arms.addEventListener('click', () => { nextArms(); btn.arms.blur(); });
+btn.family.addEventListener('click', () => { nextFamily(); btn.family.blur(); });
+
+/* ───────── optional autopilot for a booth or a screenshot:  ?demo   ?t=SECONDS (skip ahead) ───────── */
+const params = new URLSearchParams(location.search);
+const DEMO = params.has('demo')
+  ? [[8, 'a'], [24, 'f'], [40, 'a'], [56, 'f'], [72, 'f'], [88, 'a'], [104, 'f'], [120, 'f'], [136, 'a'], [152, 'f']]
+  : [];
+let demoIdx = 0;
+function runDemo() {
+  while (demoIdx < DEMO.length && DEMO[demoIdx][0] <= clock) {
+    if (DEMO[demoIdx][1] === 'a') nextArms(); else nextFamily();
+    demoIdx++;
+  }
+}
+
+resize(); refresh();
+const skip = parseFloat(params.get('t')) || 0;
+for (let s = 0; s < skip; s += 1 / 60) step(1 / 60);
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  step(dt); render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
